@@ -1,0 +1,454 @@
+/*_BEGIN_HEADER_***********************************************************************************
+Protocol                : APL2-305
+Program Name            : m_stats_calc.sas
+SAS Version             : Linux SAS 9.4
+Purpose                 : Calculate descriptive statistics for ADaM BDS data (unformatted)
+                          Output statistics in LONG format for downstream formatting
+Usage Notes             : 
+Files Used              : ADaM BDS datasets (ADLB, ADVS, etc.)
+Files Created           : Statistics dataset in LONG format
+Author Initials         : Frank Yu
+Date Program Created    : 08JAN2026
+Request                 :
+Inputs                  :
+Modification History:
+Date            Initials        Modification Description
+-------         --------        ------------------------------------------------------------------
+08JAN2026       FY              Calculation of statistics only, no formatting
+*_END_HEADER_*************************************************************************************/
+
+
+/*proc datasets lib=work kill nolist;quit;*/
+/**/
+/*%x_setenv*/
+/*%rvtsetup(tgtstudy=/Biometrics/opt/305/M24)OPTION MPRINT SOURCE2 mautolocdisplay;*/
+
+/*OPTION MPRINT SOURCE2 mautolocdisplay;*/
+
+/*libname adam '/Biometrics/standards/global/2025val/data_archive/adam' access=readonly;*/
+/*%u_incmcr(/Biometrics/standards/global/2025val/sasdev/programs/tables/paramat)*/
+/*%u_incmcr(/Biometrics/standards/global/2025val/sasdev/programs/tables/stdyfmts)*/
+/*%stdyfmts(pgmfpath=&CURRENT/stdyfmts.sas) %*#* <----- Create formats needed for test value levels (categories) *#*;*/
+
+
+
+/*==============================================================================
+  Macro: m_stats_calc
+  Purpose: Calculate descriptive statistics for BDS ADaM data (unformatted)
+  
+  Parameters:
+    inds          = Input dataset
+    where_clause  = Additional filtering condition
+    param_filter  = Specific PARAMCDs to include
+    stat_out      = Output dataset name (LONG format)
+    byvar         = BY variables
+    trtnvar       = Treatment variable of numeric values
+    trtvar        = Treatment variable of char values
+    use_chg       = Include CHG statistics (Y/N)
+    use_pchg      = Include PCHG statistics (Y/N)
+    stat_list     = List of statistics to calculate
+    cleanup       = Delete temporary datasets (Y/N)
+    
+  Output Dataset Structure (LONG format):
+    - BY variables (PARCAT1, PARAMCD, PARAM, AVISITN, AVISIT)
+    - TRTVAR (treatment variable)
+    - STAT_VAR (BASE, AVAL, CHG, or PCHG)
+    - STATISTIC (N, MEAN, STDDEV, etc.)
+    - VALUE (numeric statistic value)
+    
+  Processing Logic:
+    1. Preprocess data to create NEWVAL from BASE, AVAL, CHG, PCHG
+    2. Calculate statistics for NEWVAL by NEWVALN groups
+    3. Transpose to LONG format with STAT_VAR indicator
+    
+  Notes:
+    - BASE statistics are always included
+    - AVAL statistics are always included
+    - CHG/PCHG require use_chg=Y/use_pchg=Y and variable existence
+==============================================================================*/
+
+%macro m_stats_calc(popds=%str(adam.adsl(where=(saffl='Y')))
+					, inds=adlb
+                    , where_clause=
+                    , param_filter=
+                    , stat_out=stats_long
+                    , byvar=parcat1 paramcd param avisitn avisit
+                    , trtnvar=trt01an
+                    , trtvar=trt01a
+                    , use_chg=N
+                    , use_pchg=N
+                    , stat_list=n mean stddev median q1 q3 min max
+                    , cleanup=Y
+);
+
+%local missvars has_base has_chg has_pchg dsid rc;
+
+** Check if the input dataset exists;
+%if ^%sysfunc(exist(&inds)) %then %do;
+  %put ERROR: (m_stats_calc) Dataset &inds does not exist!;
+  %return;
+%end;
+
+** Check for required variables in input dataset;
+%let dsid = %sysfunc(open(&inds));
+
+** Check for BASE variable;
+%let has_base = 0;
+%if %sysfunc(varnum(&dsid, BASE)) > 0 %then %let has_base = 1;
+%else %do;
+  %put WARNING: (m_stats_calc) Variable BASE not found in &inds;
+  %put WARNING: (m_stats_calc) BASE statistics will not be calculated;
+%end;
+
+** Check for AVAL variable;
+%if %sysfunc(varnum(&dsid, AVAL)) = 0 %then %do;
+  %let rc = %sysfunc(close(&dsid));
+  %put ERROR: (m_stats_calc) Variable AVAL not found in &inds;
+  %put ERROR: (m_stats_calc) AVAL is required - macro execution terminated;
+  %return;
+%end;
+
+** Check for CHG variable if requested;
+%let has_chg = 0;
+%if %upcase(&use_chg) = Y %then %do;
+  %if %sysfunc(varnum(&dsid, CHG)) > 0 %then %let has_chg = 1;
+  %else %do;
+    %put WARNING: (m_stats_calc) Variable CHG not found in &inds;
+    %put WARNING: (m_stats_calc) CHG statistics will not be calculated;
+  %end;
+%end;
+
+** Check for PCHG variable if requested;
+%let has_pchg = 0;
+%if %upcase(&use_pchg) = Y %then %do;
+  %if %sysfunc(varnum(&dsid, PCHG)) > 0 %then %let has_pchg = 1;
+  %else %do;
+    %put WARNING: (m_stats_calc) Variable PCHG not found in &inds;
+    %put WARNING: (m_stats_calc) PCHG statistics will not be calculated;
+  %end;
+%end;
+
+%let rc = %sysfunc(close(&dsid));
+
+** Display processing plan;
+%put NOTE: (m_stats_calc) ========================================;
+%put NOTE: (m_stats_calc) Statistics will be calculated for:;
+%if &has_base = 1 %then %put NOTE: (m_stats_calc)   - BASE;
+%put NOTE: (m_stats_calc)   - AVAL;
+%if &has_chg = 1 %then %put NOTE: (m_stats_calc)   - CHG;
+%if &has_pchg = 1 %then %put NOTE: (m_stats_calc)   - PCHG;
+%put NOTE: (m_stats_calc) ========================================;
+
+/*==============================================================================
+  STEP 1: Preprocess data - Create NEWVAL from BASE, AVAL, CHG, PCHG
+==============================================================================*/
+
+** Apply initial filtering;
+data _a1;
+  set &inds;
+  where 1=1
+    %if %length(&where_clause) > 0 %then and (&where_clause);
+    %if %length(&param_filter) > 0 %then and paramcd in (&param_filter);
+  ;
+run;
+
+** Create NEWVAL by stacking BASE, AVAL, CHG, PCHG;
+data _a2;
+  set 
+    %if &has_base = 1 %then %do;
+      _a1 (where=(base ne . and ablfl='') drop=aval chg pchg in=a)
+    %end;
+    _a1 (in=b drop=chg pchg %if &has_base = 1 %then base;) 
+    %if &has_chg = 1 %then %do;
+      _a1 (where=(chg ne .) in=c drop=aval %if &has_base = 1 %then base; pchg)
+    %end;
+    %if &has_pchg = 1 %then %do;
+      _a1 (where=(pchg ne .) in=d drop=aval %if &has_base = 1 %then base; chg)
+    %end;
+  ;
+  
+  length STAT_VAR $8;
+  
+  %if &has_base = 1 %then %do;
+    if a then do;
+      NEWVALN = 1;
+      NEWVAL = base;
+      STAT_VAR = 'BASE';
+    end;
+    else 
+  %end;
+  if b then do;
+    NEWVALN = 2;
+    NEWVAL = aval;
+    STAT_VAR = 'AVAL';
+  end;
+  %if &has_chg = 1 %then %do;
+    else if c then do;
+      NEWVALN = 3;
+      NEWVAL = chg;
+      STAT_VAR = 'CHG';
+    end;
+  %end;
+  %if &has_pchg = 1 %then %do;
+    else if d then do;
+      NEWVALN = 4;
+      NEWVAL = pchg;
+      STAT_VAR = 'PCHG';
+    end;
+  %end;
+  
+  if NEWVAL > .;  /* Keep only non-missing NEWVAL */
+run;
+
+** Sort by BY variables + STAT_VAR + treatment;
+proc sort data=_a2 out=_sorted;
+  by &byvar STAT_VAR NEWVALN &trtnvar &trtvar;
+run;
+
+/*==============================================================================
+  STEP 2: Calculate statistics for NEWVAL
+==============================================================================*/
+
+/*==============================================================================
+  Internal Macro: _calc_stats
+  Purpose: Calculate statistics for NEWVAL
+==============================================================================*/
+%macro _calc_stats(inds=, outds=, byvar=, trtnvar=, trtvar=, stat_list=);
+  
+  /* Parse stat_list to check for geometric statistics */
+  %let stat_list_upper = %upcase(&stat_list);
+  %let has_geo_mean = 0;
+  %let has_geo_cv = 0;
+  
+  %if %index(&stat_list_upper, GEO_MEAN) %then %let has_geo_mean = 1;
+  %if %index(&stat_list_upper, GEO_CV) %then %let has_geo_cv = 1;
+  
+  /* Create cleaned stat list without geometric stats for PROC MEANS */
+  %let clean_stat_list = ;
+  %let n_stat = %sysfunc(countw(&stat_list, %str( )));
+  
+  %do i=1 %to &n_stat;
+    %let stat_&i = %scan(&stat_list, &i, %str( ));
+    %let stat_upper = %upcase(&&stat_&i);
+    %if &stat_upper ne GEO_MEAN and &stat_upper ne GEO_CV %then %do;
+      %let clean_stat_list = &clean_stat_list &&stat_&i;
+    %end;
+  %end;
+  
+  %let clean_stat_list = %sysfunc(strip(&clean_stat_list));
+  %let n_clean_stat = %sysfunc(countw(&clean_stat_list, %str( )));
+  
+  %do i=1 %to &n_clean_stat;
+    %let stat_&i = %scan(&clean_stat_list, &i, %str( ));
+  %end;
+  
+  /* Calculate standard statistics */
+  %if &n_clean_stat > 0 %then %do;
+    proc means data=&inds &clean_stat_list noprint;
+      by &byvar STAT_VAR NEWVALN &trtnvar &trtvar;
+      var NEWVAL;
+      output out=_stat_temp 
+        %do i=1 %to &n_clean_stat; 
+          &&stat_&i= 
+        %end; 
+        / AUTONAME;  
+    run;
+  %end;
+  %else %do;
+    data _stat_temp;
+      set &inds;
+      by &byvar STAT_VAR NEWVALN &trtnvar &trtvar;
+      if first.&trtnvar;
+      keep &byvar STAT_VAR NEWVALN &trtnvar &trtvar;
+    run;
+  %end;
+  
+  /* Calculate geometric statistics if requested */
+  %if &has_geo_mean or &has_geo_cv %then %do;
+    data _geo_prep;
+      set &inds;
+      where NEWVAL > 0;
+      log_NEWVAL = log(NEWVAL);
+    run;
+    
+    proc means data=_geo_prep mean stddev n noprint;
+      by &byvar STAT_VAR NEWVALN &trtnvar &trtvar;
+      var log_NEWVAL;
+      output out=_geo_temp 
+        mean=log_mean 
+        stddev=log_stddev
+        n=n_geo;
+    run;
+    
+    data _geo_stats;
+      set _geo_temp;
+      %if &has_geo_mean %then %do;
+        NEWVAL_geo_mean = exp(log_mean);
+      %end;
+      %if &has_geo_cv %then %do;
+        NEWVAL_geo_cv = sqrt(exp(log_stddev**2) - 1) * 100;
+      %end;
+      keep &byvar STAT_VAR NEWVALN &trtnvar &trtvar 
+        %if &has_geo_mean %then NEWVAL_geo_mean;
+        %if &has_geo_cv %then NEWVAL_geo_cv;
+      ;
+    run;
+    
+    data _stat_temp;
+      merge _stat_temp _geo_stats;
+      by &byvar STAT_VAR NEWVALN &trtnvar &trtvar;
+    run;
+  %end;
+  
+  /* Transpose to long format */
+  proc transpose data=_stat_temp out=_stat_trans name=statistic;
+    by &byvar STAT_VAR NEWVALN &trtnvar &trtvar _TYPE_;
+    var 
+      %if &n_clean_stat > 0 %then %do;
+        %do i=1 %to &n_clean_stat;
+          NEWVAL_&&stat_&i
+        %end;
+      %end;
+      %if &has_geo_mean %then NEWVAL_geo_mean;
+      %if &has_geo_cv %then NEWVAL_geo_cv;
+    ;
+  run;
+  
+  /* Clean statistic names */
+  data &outds;
+    set _stat_trans;
+    length stat_clean $20;
+    
+    /* Extract statistic name from variable name */
+    if index(upcase(statistic), '_GEO_') > 0 then do;
+      stat_clean = upcase(cats(scan(statistic, -2, '_'), '_', scan(statistic, -1, '_')));
+    end;
+    else do;
+      stat_clean = upcase(scan(statistic, -1, '_'));
+    end;
+    
+    /* Preserve NEWVALN for final sorting */
+    retain NEWVALN;
+    
+    drop statistic;
+    rename stat_clean = statistic
+           col1 = value;
+  run;
+  
+/*==============================================================================
+  STEP 3: Calculate the number of population in each treatment arm, and combine it 
+  			with the statistics output.
+==============================================================================*/
+
+/*%macro mbign(popds=%str(adam.adsl(where=(saffl='Y')))*/
+/*	, trtnvar=trtseqan*/
+/*	, trtvar=trtseqa*/
+/*	,  outds=_stats_out*/
+/*);*/
+	data pop;
+	  set &popds;
+	run;
+
+	proc sql noprint;
+		create table bign as
+        select &trtnvar, count(distinct usubjid) as bign
+        from pop group by &trtnvar
+		; 
+
+		create table &outds as
+		select a.*, b.bign as _FREQ_
+		from &outds as a left join bign as b
+		on a.&trtnvar=b.&trtnvar;
+	quit;
+/*%mend mbign;*/
+/*%mbign;*/
+
+%mend _calc_stats;
+
+** Calculate statistics for NEWVAL;
+%_calc_stats(inds=_sorted, outds=_stats_out, 
+             byvar=&byvar, trtnvar=&trtnvar, trtvar=&trtvar, stat_list=&stat_list);
+
+** Sort final output;
+proc sort data=_stats_out out=&stat_out;
+  by &byvar NEWVALN &trtvar;* statistic;
+run;
+
+** Clean up temporary datasets;
+%if %upcase(&cleanup) = Y %then %do;
+  proc datasets library=work nolist;
+    delete _a1 _a2 _sorted _stat_: _geo_prep _geo_temp _geo_stats _stats_out;
+  quit;
+%end;
+
+%put NOTE: (m_stats_calc) Statistics calculated successfully;
+%put NOTE: (m_stats_calc) Output dataset: &stat_out (LONG format);
+
+%mend m_stats_calc;
+
+
+/*==============================================================================
+  EXAMPLE USAGE
+==============================================================================*/
+
+/*
+** Example 1: Basic usage (BASE and AVAL only);
+%m_stats_calc(
+    inds=adam.adlb,
+    stat_out=lab_stats_long,
+    stat_list=n mean stddev median min max
+);
+
+** Example 2: With CHG;
+%m_stats_calc(
+    inds=adam.adlb,
+    where_clause=%STR(saffl='Y'),
+    param_filter=%STR('ALB' 'ALP'),
+    stat_out=lab_stats_long,
+    use_chg=Y,
+    stat_list=n mean stddev median q1 q3
+);
+
+** Example 3: All variables (BASE, AVAL, CHG, PCHG);
+%m_stats_calc(
+    inds=adam.adlb,
+    stat_out=lab_stats_long,
+    use_chg=Y,
+    use_pchg=Y,
+    stat_list=n mean stddev median min max geo_mean geo_cv
+);
+
+** Example 4: With AVISITN and AVISIT in byvar;
+%m_stats_calc(
+    inds=adam.adga,
+    where_clause=%STR(fasfl='Y' and anl01fl='Y' and basetype='EXTENSION'),
+    param_filter=%STR('SEGAORG'),
+    byvar=paramcd param avisitn avisit,
+    use_chg=Y,
+    stat_out=ga_stats_long,
+    stat_list=n mean stddev median q1 q3 min max
+);
+
+** Example 5: CHG and PCHG (even if variables don't exist, macro handles it);
+%m_stats_calc(
+    inds=adam.adlb,
+    where_clause=%STR(avisitn > 0),
+    use_chg=Y,
+    use_pchg=Y,
+    stat_out=chg_stats_long,
+    stat_list=n mean stddev median lclm uclm
+);
+*/
+
+** 305 M24 T14.2.1.1.1.1;
+%*m_stats_calc(inds=adam.adga
+    , where_clause=%STR(  fasfl='Y' and anl01fl="Y" and basetype="EXTENSION" and avisitn<=24)
+    , param_filter=%STR('SEGAORG')
+    , stat_out=ga_stats_long
+	, byvar=paramcd param avisitn avisit
+    , trtvar=trtseqan
+    , use_chg=Y
+    , use_pchg=Y
+    , stat_list=n mean stddev median q1 q3 min max 
+    , cleanup=N
+);
